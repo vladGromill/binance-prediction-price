@@ -76,23 +76,6 @@ class DataLoader(ABC):
     def load_data(self) -> Tuple[Optional[Dict[str, pd.DataFrame]], Optional[pd.DataFrame]]:
         """Load data according to the config and return (orderbooks, trades)."""
 
-    def match_trades_orderbooks(self, orderbooks: Dict[str, pd.DataFrame], trades: pd.DataFrame) -> Tuple[Dict[str, pd.DataFrame], pd.DataFrame]:
-        """Template method to match trades with orderbooks by date.
-
-        The user can override this method to implement custom matching logic.
-
-        Parameters:
-          - orderbooks: dict mapping date string -> orderbook DataFrame
-          - trades: full trades DataFrame
-
-        Returns:
-          - (matched_orderbooks, matched_trades)
-
-        Default implementation is a no-op and simply returns the inputs unchanged.
-        """
-        LOG.debug("Default match_trades_orderbooks called — returning inputs unchanged")
-        return orderbooks, trades
-
 
 class ParquetDataLoader(DataLoader):
     """Concrete loader that reads parquet files from disk."""
@@ -125,12 +108,98 @@ class ParquetDataLoader(DataLoader):
 
     def load_trades(self) -> pd.DataFrame:
         """Load trades parquet. Uses data_trades if provided, otherwise path_to_trades."""
-        path = self.cfg.data_trades or self.cfg.path_to_trades
+        path = self.cfg.path_to_trades + "/" + self.cfg.data_trades
         if path is None:
             raise ValueError("No trades file path provided in config")
         df = self._read_parquet_safe(path, self.cfg.cols_trades)
         return df
 
+    def match_trades_orderbooks(self, window_size: str = "5min") -> pd.DataFrame:
+        """
+        Matches orderbooks to trade features: cumulative and window-based aggregates (e.g., volume, ratio, avg price)
+        without lookahead bias. Computes window stats up to the last preceding trade for each orderbook.
+
+        Args:
+            window_size (str): Window size for aggregates, e.g., "5min", "1h". Uses pd.Timedelta.
+
+        Returns:
+            pd.DataFrame: Merged orderbooks with attached trade features (window aggs + last trade details).
+        """
+        LOG.debug("match_trades_orderbooks called with window_size=%s", window_size)
+        orderbooks = self.load_orderbooks()
+        trades = self.load_trades()
+        
+        # Ensure sorted and unique index
+        orderbooks = orderbooks.sort_values('datetime').reset_index(drop=True)
+        trades = trades.sort_values('datetime').reset_index(drop=True)
+        
+        trades['price'] = pd.to_numeric(trades['price'], errors='coerce').astype('float64')
+        trades['quantity'] = pd.to_numeric(trades['quantity'], errors='coerce').astype('float64')
+        
+        # Cumulative features (vectorized, no loc/reindex issues)
+        trades["cum_trades_count"] = trades.index + 1
+        trades["cum_volume"] = trades["quantity"].cumsum()
+        is_buy = trades["is_buyer_maker"].astype(int)
+        trades["cum_buyer_count"] = trades["is_buyer_maker"].astype(int).cumsum()  # Count of buyer-initiated
+        trades["cum_weighted"] = (trades["price"] * trades["quantity"]).cumsum()  # For weighted avg
+        trades["cum_volume_buyer"]  = (trades["quantity"] * is_buy).cumsum()
+        trades["cum_volume_seller"] = (trades["quantity"] * (1 - is_buy)).cumsum()
+        trades["ratio_buy"] = trades["cum_buyer_count"] / trades["cum_trades_count"]  # Cumulative ratio
+        trades["avg_price"] = trades["cum_weighted"] / trades["cum_volume"]  # Cumulative VWAP-like
+
+        # Window features: subtract prev cum at (datetime - window)
+        trades["shifted_datetime"] = trades["datetime"] - pd.Timedelta(window_size)
+        right_cols = [
+            'datetime', 'cum_volume_buyer', 'cum_volume_seller', 'cum_volume',
+            'cum_trades_count', 'cum_buyer_count', 'cum_weighted'
+        ]
+
+        # merge_asof to find previous cumulative values at (datetime - window_size)
+        # we merge the shifted timestamps against the original trades and then
+        # rename the resulting columns to have a _prev suffix (so subsequent
+        # lookups like temp['cum_volume_prev'] exist)
+        temp = pd.merge_asof(
+            trades[['shifted_datetime']].rename(columns={'shifted_datetime': 'datetime'}),
+            trades[[c for c in right_cols]],
+            on='datetime',
+            direction='backward'
+        )
+
+        # Rename previous columns to have _prev suffix
+        prev_map = {c: f"{c}_prev" for c in right_cols if c != 'datetime'}
+        temp = temp.rename(columns=prev_map)
+
+        # Window calcs (use _prev columns produced above)
+        trades['window_volume'] = trades['cum_volume'] - temp['cum_volume_prev'].fillna(0)
+        trades['window_volume_buyer'] = trades['cum_volume_buyer'] - temp['cum_volume_buyer_prev'].fillna(0)
+        trades['window_volume_seller'] = trades['cum_volume_seller'] - temp['cum_volume_seller_prev'].fillna(0)
+        window_total_count = trades['cum_trades_count'] - temp['cum_trades_count_prev'].fillna(0)
+        window_buyer_count = trades['cum_buyer_count'] - temp['cum_buyer_count_prev'].fillna(0)
+        trades['window_ratio_buy'] = window_buyer_count / (window_total_count + 1e-6)
+        window_weighted = trades['cum_weighted'] - temp['cum_weighted_prev'].fillna(0)
+        trades['window_avg_price'] = window_weighted / (trades['window_volume'] + 1e-6)
+        
+        trade_feature_cols = [
+            c for c in trades.columns
+            if c not in ['datetime', 'trade_id', 'price', 'quantity', 'is_buyer_maker']
+        ]
+
+        trades[trade_feature_cols] = trades[trade_feature_cols].shift(1)
+        
+        # Merge: attach to orderbooks (last preceding trade's features)
+        drop_cols = ['shifted_datetime', 'trade_id'] + [col for col in right_cols if col != 'datetime']
+        trades_merged = trades.drop(columns=drop_cols)  # Drop cum/prev, keep window + original trade cols
+        merged = pd.merge_asof(
+            orderbooks,
+            trades_merged,
+            on='datetime',
+            direction='backward',
+            suffixes=('_orderbook', '_trade')
+        )
+        
+        LOG.debug("Merged shape: %s", merged.shape)
+        return merged
+    
     def load_data(self) -> Optional[pd.DataFrame]:
         out_data = None
 
